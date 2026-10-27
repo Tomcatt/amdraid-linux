@@ -8,8 +8,17 @@ sudo python3 -I amdraid-scan.py      # prints commands, runs nothing
 python3 -I test_scan.py              # parser check against a synthetic config area
 ```
 
-**Status: experimental, read-only.** Verified on one array (2x NVMe RAID0, 256K stripe):
-the reassembled volume mounts and file CRCs check out.
+**Status: experimental, read-only.** Verified on two boards; on both the reassembled volume
+mounts read-only and file CRCs check out:
+
+| Board (chipset) | Array |
+|---|---|
+| MSI MEG X870E GODLIKE (X870E) | RAID0, 2x NVMe, 256K stripe |
+| Gigabyte X570 AORUS XTREME (X570) | RAID0, 3x NVMe (mixed models), 256K stripe |
+
+The X570 array was read with the BIOS switched back to AHCI, so the members only need to be
+visible as plain disks. AMD's driver lists Bolton, Bristol, Promontory and Summit platforms, so
+other AM4/AM5 boards are likely the same format; reports welcome.
 
 Format notes are in the docstring of `amdraid-scan.py`; field names come from the DWARF
 debug info AMD shipped in the rcraid 9.3.3 driver blob. RAID1, RAID10 and RAID5
