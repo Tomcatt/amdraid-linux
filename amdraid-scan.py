@@ -2,18 +2,26 @@
 """Read AMD RAIDXpert (RAIDCore) metadata and print read-only dmsetup commands.
 
 Never writes to any disk. Run as root: sudo python3 -I amdraid-scan.py
-Format notes (reverse-engineered 2026-10-25 from one 2x NVMe RAID0):
+USE AT YOUR OWN RISK: unofficial, unaffiliated with AMD, no warranty; the authors are not
+responsible for data loss. Back up first and check every printed command before running it.
+Format (struct and field names from the DWARF debug info in AMD's rcraid 9.3.3 rcblob.x86_64):
   disk header  @ LBA 20480: 'RAIDCore' at +0x08, disk id u64 at +0x10,
                config area LBA u64 at +0x20, length (sectors) u32 at +0x28
-  config area: 128-byte objects, u32 tag first. 0x25BD = volume:
-               +0x04 u32 stripe (sectors, UNCONFIRMED: one sample), +0x50 u64 size,
-               +0x60 u32 level (5 = RAID0 seen; 0 = legacy single disk), +0x68 u32 nmembers,
-               members at +0x200 + 0x40*i: id u64, data start u64 @+0x20, data len u64 @+0x28
+  config area: 128-byte-aligned objects, u32 StructureType first (0x25BC physical, 0x25BD logical)
+  RC_LogicalDevice: +0x04 LogicalElementOffset, +0x08 State (0x200 = NORMAL), +0x0C DeviceType,
+               +0x2C volume id u64, +0x50 Capacity u64, +0x60 GenerationNumber u64,
+               +0x6C FirstCount (columns), +0x70 SecondCount (copies per column),
+               +0x110 CacheTagSize = stripe code (3: 256K, 2: 128K, else 64K; per RC_GetStripeStartSector)
+  RC_LogicalElement_LE, 0x40 each at LogicalElementOffset, index column*SecondCount + copy:
+               +0x00 DeviceID u64, +0x20 UserDataSpace.SectorOffset u64, +0x28 UserDataSpace.Size u64
+  DeviceType:  0x1BF5 RAID5/50, 0x1BF6 RAID0/1/10 (RC_RAID10N), 0x1BF7 volume, 0x1BF9 legacy, 0x1BFA RAID6/60
+Verified on hardware: 2x NVMe RAID0, 256K. RAID1/10 follow from the driver code, untested on disks.
 """
 import glob, os, struct, sys
 
 HDR_LBA, SECT = 20480, 512
-VOL_TAG, RAID0 = 0x25BD, 5
+VOL_TAG, RAID10N, NORMAL = 0x25BD, 0x1BF6, 0x200
+STRIPE = {3: 512, 2: 256}  # CacheTagSize code -> sectors; anything else is 128 (64K)
 
 
 def read(dev, lba, n):
@@ -38,51 +46,75 @@ def scan_disks():
     return disks
 
 
-def parse_volumes(cfg, disks):
-    vols = {}
-    for off in range(0, len(cfg) - 0x300, 0x80):
+def parse_volumes(cfg):
+    vols = {}  # volume id -> newest copy in the config log
+    for off in range(0, len(cfg) - 0x114, 0x80):
         if struct.unpack_from('<I', cfg, off)[0] != VOL_TAG:
             continue
-        stripe = struct.unpack_from('<I', cfg, off + 0x04)[0]
+        elem_off, state, dtype = struct.unpack_from('<III', cfg, off + 0x04)
+        vid, = struct.unpack_from('<Q', cfg, off + 0x2C)
         size, = struct.unpack_from('<Q', cfg, off + 0x50)
-        level, n = struct.unpack_from('<I4xI', cfg, off + 0x60)
-        if not 2 <= n <= 8 or off + 0x200 + 0x40 * n > len(cfg):
-            continue  # legacy single-disk volumes (n=1) need no assembly
+        gen, = struct.unpack_from('<Q', cfg, off + 0x60)
+        cols, copies = struct.unpack_from('<II', cfg, off + 0x6C)
+        code, = struct.unpack_from('<I', cfg, off + 0x110)
+        n = cols * copies
+        if not 1 <= n <= 16 or off + elem_off + 0x40 * n > len(cfg):
+            continue
         members = []
         for i in range(n):
-            m = off + 0x200 + 0x40 * i
+            m = off + elem_off + 0x40 * i
             mid, = struct.unpack_from('<Q', cfg, m)
             start, length = struct.unpack_from('<QQ', cfg, m + 0x20)
             members.append((mid, start, length))
-        if all(mid in disks for mid, _, _ in members):
-            vols[tuple(members)] = (level, stripe, size, members)
-    return list(vols.values())  # ponytail: dedupe identical journal copies, newest-wins if they ever differ
+        if vid not in vols or gen > vols[vid]['gen']:
+            vols[vid] = dict(gen=gen, state=state, dtype=dtype, cols=cols, copies=copies,
+                             stripe=STRIPE.get(code, 128), size=size, members=members)
+    return list(vols.values())
 
 
-def dm_table(level, stripe, size, members, disks):
-    if level != RAID0:
+def name(v):
+    if v['dtype'] != RAID10N:
+        return f'type 0x{v["dtype"]:X}'
+    return 'RAID0' if v['copies'] == 1 else 'RAID1' if v['cols'] == 1 else 'RAID10'
+
+
+def dm_table(v, disks):
+    """Read-only table using the first present copy of each column; None if unsupported or incomplete."""
+    if v['dtype'] != RAID10N or (v['copies'] == 1 and v['cols'] == 1):
+        return None  # parity layouts undecoded; 1x1 is a legacy passthrough disk, needs no assembly
+    cols = [v['members'][c * v['copies']:(c + 1) * v['copies']] for c in range(v['cols'])]
+    picks = [next((m for m in col if m[0] in disks), None) for col in cols]
+    if None in picks:
         return None
-    assert size == sum(l for _, _, l in members), 'member lengths do not add up to volume size'
-    devs = ' '.join(f'{disks[mid][0]} {start}' for mid, start, _ in members)
-    return f'0 {size} striped {len(members)} {stripe} {devs}'
+    assert v['size'] == sum(l for _, _, l in picks), 'member lengths do not add up to volume size'
+    if len(picks) == 1:
+        mid, start, _ = picks[0]
+        return f'0 {v["size"]} linear {disks[mid][0]} {start}'
+    devs = ' '.join(f'{disks[mid][0]} {start}' for mid, start, _ in picks)
+    return f'0 {v["size"]} striped {len(picks)} {v["stripe"]} {devs}'
 
 
 def main():
     disks = scan_disks()
+    print('# Use at your own risk: no warranty, authors not responsible for data loss. Review before running.')
     print(f'# RAIDCore disks: {", ".join(d for d, _ in disks.values()) or "none"}')
-    seen = set()
-    for dev, cfg in disks.values():
-        for level, stripe, size, members in parse_volumes(cfg, disks):
-            t = dm_table(level, stripe, size, members, disks)
-            if t in seen:
-                continue
-            seen.add(t)
-            if t is None:
-                print(f'# unsupported level {level} with {len(members)} members, skipped')
-                continue
-            print(f'# RAID0 {len(members)} members, {size * SECT / 1e12:.2f} TB, stripe {stripe * SECT // 1024}K')
-            print(f'blockdev --setro {" ".join(disks[m][0] for m, _, _ in members)}')
-            print(f'dmsetup create amdraid{len(seen) - 1} --readonly --table "{t}"')
+    vols = {}
+    for _, cfg in disks.values():  # every member carries a copy of the log; keep the newest per volume
+        for v in parse_volumes(cfg):
+            key = tuple(m for m, _, _ in v['members'])
+            if key not in vols or v['gen'] > vols[key]['gen']:
+                vols[key] = v
+    for i, v in enumerate(vols.values()):
+        t = dm_table(v, disks)
+        if t is None:
+            if v['cols'] * v['copies'] > 1:
+                print(f'# {name(v)} {v["cols"]}x{v["copies"]}: unsupported or members missing, skipped')
+            continue
+        warn = '' if v['state'] == NORMAL else f'  WARNING: state 0x{v["state"]:X}, not NORMAL'
+        print(f'# {name(v)} {v["cols"]}x{v["copies"]}, {v["size"] * SECT / 1e12:.2f} TB, '
+              f'stripe {v["stripe"] * SECT // 1024}K{warn}')
+        print(f'blockdev --setro {" ".join(disks[m][0] for m, _, _ in v["members"] if m in disks)}')
+        print(f'dmsetup create amdraid{i} --readonly --table "{t}"')
 
 
 if __name__ == '__main__':
