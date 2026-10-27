@@ -17,8 +17,8 @@ Format (struct and field names from the DWARF debug info in AMD's rcraid 9.3.3 r
   DeviceType:  0x1BF5 RAID5/50, 0x1BF6 RAID0/1/10 (RC_RAID10N), 0x1BF7 volume, 0x1BF9 legacy, 0x1BFA RAID6/60
   RAID5 (RC_Raid50LogicalToPhysical, one group): SecondCount disks, row = chunk / (n-1),
                parity on disk row % n, data fills disks in order skipping it = md/dm-raid raid5_ra
-Verified on hardware: 2x NVMe RAID0, 256K. RAID1/10/5 follow from the driver code; RAID5 checked
-against dm-raid on loop images, none of the three tested on real disks.
+Verified on hardware: 2x NVMe RAID0, 256K. RAID1/10/5 follow the driver's address math and match it
+on loop images (full and degraded); none of the three tested on real disks.
 """
 import glob, os, struct, sys
 

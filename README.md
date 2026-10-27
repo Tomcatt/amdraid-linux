@@ -12,10 +12,10 @@ python3 -I test_scan.py              # parser check against a synthetic config a
 the reassembled volume mounts and file CRCs check out.
 
 Format notes are in the docstring of `amdraid-scan.py`; field names come from the DWARF
-debug info AMD shipped in the rcraid 9.3.3 driver blob. RAID1/RAID10 tables follow from the
-driver code but are untested on real disks. RAID5 (right-asymmetric parity, assembled with
-dm-raid `raid5_ra`, reads degraded with one member missing) was checked against loop-device
-images encoded from the driver's address math, also not yet on real disks. RAID50/6/60 and
+debug info AMD shipped in the rcraid 9.3.3 driver blob. RAID1, RAID10 and RAID5
+(right-asymmetric parity, assembled with dm-raid `raid5_ra`) were checked against loop-device
+images encoded from the driver's own address math, including degraded arrays with a member
+missing. None of the three has been tested on real disks yet. RAID50/6/60 and
 spanned volumes are detected but not assembled.
 
 Never mount the result read-write; Windows Fast Startup leaves NTFS in a hibernated state.
