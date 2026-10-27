@@ -7,8 +7,8 @@ scan = importlib.util.module_from_spec(spec); spec.loader.exec_module(scan)
 A, B, C, D = 0x11, 0x22, 0x33, 0x44
 
 
-def volume(cfg, off, vid, gen, cols, copies, code, members, size):
-    struct.pack_into('<IIII', cfg, off, scan.VOL_TAG, 0x200, scan.NORMAL, scan.RAID10N)
+def volume(cfg, off, vid, gen, cols, copies, code, members, size, dtype=scan.RAID10N):
+    struct.pack_into('<IIII', cfg, off, scan.VOL_TAG, 0x200, scan.NORMAL, dtype)
     struct.pack_into('<Q', cfg, off + 0x2C, vid)
     struct.pack_into('<Q', cfg, off + 0x50, size)
     struct.pack_into('<Q', cfg, off + 0x60, gen)
@@ -40,4 +40,14 @@ volume(r10, 0, 9, 1, 2, 2, 0, [(A, 2048, 500), (B, 2048, 500), (C, 2048, 500), (
 v, = scan.parse_volumes(bytes(r10))
 assert scan.name(v) == 'RAID10' and v['stripe'] == 128
 assert scan.dm_table(v, disks) == '0 1000 striped 2 128 /dev/A 2048 /dev/C 2048'      # copy 0 of each column
+
+r5 = bytearray(2048 * 512)
+volume(r5, 0, 10, 1, 1, 3, 3, [(A, 2048, 51200), (B, 4096, 51200), (C, 2048, 51200)], 102400, scan.RAID5)
+v, = scan.parse_volumes(bytes(r5))
+assert scan.name(v) == 'RAID5'
+assert scan.dm_tables(v, disks, 'x') == [
+    ('xm0', '0 51200 linear /dev/A 2048'), ('xm1', '0 51200 linear /dev/B 4096'), ('xm2', '0 51200 linear /dev/C 2048'),
+    ('x', '0 102400 raid raid5_ra 2 512 nosync 3 - /dev/mapper/xm0 - /dev/mapper/xm1 - /dev/mapper/xm2')]
+assert scan.dm_tables(v, {A: disks[A], C: disks[C]}, 'x')[-1][1].endswith('- /dev/mapper/xm0 - - - /dev/mapper/xm2')
+assert scan.dm_tables(v, {A: disks[A]}, 'x') == []                                   # two missing: unreadable
 print('ok')
