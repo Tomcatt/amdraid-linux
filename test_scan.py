@@ -50,4 +50,12 @@ assert scan.dm_tables(v, disks, 'x') == [
     ('x', '0 102400 raid raid5_ra 2 512 nosync 3 - /dev/mapper/xm0 - /dev/mapper/xm1 - /dev/mapper/xm2')]
 assert scan.dm_tables(v, {A: disks[A], C: disks[C]}, 'x')[-1][1].endswith('- /dev/mapper/xm0 - - - /dev/mapper/xm2')
 assert scan.dm_tables(v, {A: disks[A]}, 'x') == []                                   # two missing: unreadable
+r0 = scan.parse_volumes(bytes(cfg))[0]
+assert scan.commands(r0, disks, 'x', rw=True)[1:] == [
+    'blockdev --setrw /dev/A /dev/B', 'dmsetup create x --table "0 7811850240 striped 2 512 /dev/A 1069056 /dev/B 1069056"']
+assert scan.commands(r0, disks, 'x')[-1].startswith('dmsetup create x --readonly ')
+assert scan.commands(v, disks, 'x', rw=True)[1] == '# --rw refused: RAID0 in NORMAL state only; read-only instead'   # RAID5
+assert all('--readonly' in l for l in scan.commands(v, disks, 'x', rw=True) if l.startswith('dmsetup'))
+r0['state'] = 0x100
+assert '--rw refused' in scan.commands(r0, disks, 'x', rw=True)[1]                   # not NORMAL: stay ro
 print('ok')

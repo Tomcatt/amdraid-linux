@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Read AMD RAIDXpert (RAIDCore) metadata and print read-only dmsetup commands.
+"""Read AMD RAIDXpert (RAIDCore) metadata and print dmsetup commands (read-only unless --rw).
 
-Never writes to any disk. Run as root: sudo python3 -I amdraid-scan.py
+Never writes to any disk itself. Run as root: sudo python3 -I amdraid-scan.py [--rw]
+--rw prints a writable table for RAID0 only: RAID0 has no parity or mirror, so data writes never
+need a metadata update, and the table maps only each member's UserDataSpace, so the metadata
+region can't be touched. Redundant levels stay read-only (no dirty/resync tracking yet).
 USE AT YOUR OWN RISK: unofficial, unaffiliated with AMD, no warranty; the authors are not
 responsible for data loss. Back up first and check every printed command before running it.
 Format (struct and field names from the DWARF debug info in AMD's rcraid 9.3.3 rcblob.x86_64):
@@ -124,7 +127,26 @@ def dm_table(v, disks):
     return f'0 {v["size"]} striped {len(picks)} {v["stripe"]} {devs}'
 
 
+def commands(v, disks, dm, rw=False):
+    """Comment + shell lines to assemble one volume; [] if it can't be assembled."""
+    tables = dm_tables(v, disks, dm)
+    if not tables:
+        return [f'# {name(v)} {v["cols"]}x{v["copies"]}: unsupported or members missing, skipped'] \
+            if v['cols'] * v['copies'] > 1 else []
+    warn = '' if v['state'] == NORMAL else f'  WARNING: state 0x{v["state"]:X}, not NORMAL'
+    out = [f'# {name(v)} {v["cols"]}x{v["copies"]}, {v["size"] * SECT / 1e12:.2f} TB, '
+           f'stripe {v["stripe"] * SECT // 1024}K{warn}']
+    if rw and (name(v) != 'RAID0' or warn):
+        out.append('# --rw refused: RAID0 in NORMAL state only; read-only instead')
+        rw = False
+    devs = ' '.join(disks[m][0] for m, _, _ in v['members'] if m in disks)
+    out.append(f'blockdev --setrw {devs}' if rw else f'blockdev --setro {devs}')
+    out += [f'dmsetup create {d}{"" if rw else " --readonly"} --table "{t}"' for d, t in tables]
+    return out
+
+
 def main():
+    rw = '--rw' in sys.argv[1:]
     disks = scan_disks()
     print('# Use at your own risk: no warranty, authors not responsible for data loss. Review before running.')
     print(f'# RAIDCore disks: {", ".join(d for d, _ in disks.values()) or "none"}')
@@ -135,17 +157,7 @@ def main():
             if key not in vols or v['gen'] > vols[key]['gen']:
                 vols[key] = v
     for i, v in enumerate(vols.values()):
-        tables = dm_tables(v, disks, f'amdraid{i}')
-        if not tables:
-            if v['cols'] * v['copies'] > 1:
-                print(f'# {name(v)} {v["cols"]}x{v["copies"]}: unsupported or members missing, skipped')
-            continue
-        warn = '' if v['state'] == NORMAL else f'  WARNING: state 0x{v["state"]:X}, not NORMAL'
-        print(f'# {name(v)} {v["cols"]}x{v["copies"]}, {v["size"] * SECT / 1e12:.2f} TB, '
-              f'stripe {v["stripe"] * SECT // 1024}K{warn}')
-        print(f'blockdev --setro {" ".join(disks[m][0] for m, _, _ in v["members"] if m in disks)}')
-        for dm, t in tables:
-            print(f'dmsetup create {dm} --readonly --table "{t}"')
+        print('\n'.join(commands(v, disks, f'amdraid{i}', rw)))
 
 
 if __name__ == '__main__':
